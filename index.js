@@ -1,101 +1,95 @@
 
 // AUTHOR: 𝐑𝐉 𝐬𝐢𝐲𝐚𝐦
+// WARNING: AUTHOR পরিবর্তন করলে এই ফাইল Disable হবে।
 
+import "dotenv/config";
 import fs from "fs-extra";
+import path from "path";
+import { fileURLToPath } from "url";
 
-import { CONFIG } from "./config.js";
-
+import { AUTHOR, CONFIG } from "./config.js";
 import { createLogger } from "./system/logger.js";
 import { validateAuthor } from "./scripts/authorGuard.js";
 import { printWatchdog } from "./system/watchdog.js";
-
 import { connectToWhatsApp } from "./core/connection.js";
 import { loadCommands } from "./core/commandHandler.js";
 import { handleMessages } from "./core/messageHandler.js";
 import { loadEvents, attachEvents } from "./core/eventHandler.js";
 import { installErrorHandlers } from "./core/errorHandler.js";
 
-import { DisconnectReason } from "@whiskeysockets/baileys";
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const logger = createLogger();
 
-let currentSocket = null;
+let sock = null;
+let isStarting = false;
 let reconnectTimer = null;
 let reconnectAttempts = 0;
-let isStopping = false;
-let isStarting = false;
+let isShuttingDown = false;
+
+const directories = [
+  CONFIG.SESSION_DIR || "./session",
+  CONFIG.COMMAND_DIR || "./scripts/cmds",
+  CONFIG.EVENT_DIR || "./scripts/events",
+  CONFIG.DATABASE?.DIRECTORY || "./database",
+  "./logs"
+];
 
 async function prepareDirectories() {
-  await Promise.all([
-    fs.ensureDir(CONFIG.SESSION_DIR),
-    fs.ensureDir(CONFIG.COMMAND_DIR),
-    fs.ensureDir(CONFIG.EVENT_DIR),
-    fs.ensureDir(CONFIG.DATABASE_DIR)
-  ]);
+  for (const directory of directories) {
+    if (!directory || typeof directory !== "string") {
+      throw new Error(`Invalid directory path: ${directory}`);
+    }
+
+    await fs.ensureDir(path.resolve(__dirname, directory));
+  }
+
+  await fs.ensureFile(
+    path.resolve(__dirname, "database/users.json")
+  );
+
+  await fs.ensureFile(
+    path.resolve(__dirname, "database/groups.json")
+  );
 }
 
 async function startBot() {
-  if (isStopping || isStarting) return;
+  if (isStarting || isShuttingDown) return;
 
   isStarting = true;
 
   try {
+    logger.info(`Starting ${CONFIG.BOT_NAME}`);
+
     await prepareDirectories();
 
-    logger.info("Starting " + CONFIG.BOT_NAME);
+    const authorResult = await validateAuthor();
 
-    if (CONFIG.AUTHOR_CHECK) {
-      await validateAuthor();
+    if (authorResult === false) {
+      throw new Error("Author integrity validation failed.");
     }
 
+    logger.success("Author integrity check completed");
+
     const commands = await loadCommands();
+    logger.success(`Loaded ${commands?.size || 0} commands`);
+
     const events = await loadEvents();
+    logger.success(`Loaded ${events?.length || 0} events`);
 
-    logger.success(`Loaded ${commands.size} commands`);
-    logger.success(`Loaded ${events.size} events`);
+    sock = await connectToWhatsApp();
 
-    const sock = await connectToWhatsApp();
-
-    currentSocket = sock;
+    if (!sock) {
+      throw new Error("WhatsApp socket creation failed");
+    }
 
     handleMessages(sock);
+    attachEvents(sock, events);
 
-    attachEvents(sock);
+    reconnectAttempts = 0;
 
-    sock.ev.on("connection.update", async update => {
-      const { connection, lastDisconnect } = update;
-
-      if (connection === "open") {
-        reconnectAttempts = 0;
-
-        logger.success("WhatsApp connected successfully");
-        logger.success(CONFIG.BOT_NAME);
-
-        printWatchdog();
-      }
-
-      if (connection === "close") {
-        currentSocket = null;
-
-        const statusCode =
-          lastDisconnect?.error?.output?.statusCode;
-
-        logger.warn(
-          `Connection closed. Status: ${statusCode ?? "unknown"}`
-        );
-
-        if (statusCode === DisconnectReason.loggedOut) {
-          logger.error(
-            "WhatsApp session logged out. Relink the account."
-          );
-          isStopping = true;
-          return;
-        }
-
-        scheduleReconnect();
-      }
-    });
-
+    logger.success("WhatsApp event listeners attached");
   } catch (error) {
     logger.error("Bot startup failed", error);
     scheduleReconnect();
@@ -105,34 +99,75 @@ async function startBot() {
 }
 
 function scheduleReconnect() {
-  if (isStopping || reconnectTimer) return;
+  if (isShuttingDown || reconnectTimer) return;
 
   reconnectAttempts++;
 
   const delay = Math.min(
-    CONFIG.RECONNECT_DELAY * Math.pow(2, reconnectAttempts - 1),
-    CONFIG.MAX_RECONNECT_DELAY
+    5000 * Math.pow(2, reconnectAttempts - 1),
+    60000
   );
 
-  logger.warn(`Reconnecting in ${Math.round(delay / 1000)} seconds`);
+  logger.warn(
+    `Reconnecting in ${Math.round(delay / 1000)} seconds`
+  );
 
-  reconnectTimer = setTimeout(async () => {
+  reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
-    await startBot();
+    startBot().catch(error =>
+      logger.error("Reconnect failed", error)
+    );
   }, delay);
 }
 
-installErrorHandlers(logger);
+function installConnectionHandler(socket) {
+  socket.ev.on("connection.update", ({ connection, lastDisconnect }) => {
+    if (connection === "open") {
+      reconnectAttempts = 0;
+
+      logger.success(
+        `WhatsApp connected: ${socket.user?.id || "Connected"}`
+      );
+    }
+
+    if (connection === "close") {
+      const status =
+        lastDisconnect?.error?.output?.statusCode;
+
+      logger.warn(`WhatsApp disconnected. Status: ${status}`);
+
+      if (isShuttingDown) return;
+
+      if (status === 401 || status === 403) {
+        logger.error(
+          "WhatsApp session logged out. Manual relinking required."
+        );
+        return;
+      }
+
+      scheduleReconnect();
+    }
+  });
+}
+
+async function boot() {
+  installErrorHandlers(logger);
+  printWatchdog();
+
+  await prepareDirectories();
+
+  const originalConnect = connectToWhatsApp;
+
+  await startBot();
+}
 
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
 
 async function shutdown() {
-  if (isStopping) return;
+  if (isShuttingDown) return;
 
-  isStopping = true;
-
-  logger.warn("Stopping bot...");
+  isShuttingDown = true;
 
   if (reconnectTimer) {
     clearTimeout(reconnectTimer);
@@ -140,13 +175,17 @@ async function shutdown() {
   }
 
   try {
-    currentSocket?.end?.(new Error("Bot shutdown"));
+    if (sock) {
+      sock.end(new Error("Bot shutting down"));
+    }
   } catch (error) {
     logger.error("Shutdown error", error);
   }
 
-  logger.success("Bot stopped");
   process.exit(0);
 }
 
-startBot();
+boot().catch(error => {
+  logger.error("Fatal startup error", error);
+  process.exitCode = 1;
+});
