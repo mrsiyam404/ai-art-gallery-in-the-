@@ -1,9 +1,13 @@
 
 // AUTHOR: 𝐑𝐉 𝐬𝐢𝐲𝐚𝐦
-// WARNING: AUTHOR পরিবর্তন করলে এই ফাইল Disable হবে।
+// WARNING: AUTHOR পরিবর্তন করলে এই ফাইল Disable হবে.
 
-import { AUTHOR, CONFIG, isOwner, isBotAdmin } from "../config.js";
-import { getGroup } from "../database/groups.js";
+import {
+  AUTHOR,
+  CONFIG,
+  isOwner,
+  isBotAdmin
+} from "../config.js";
 
 export const ROLES = Object.freeze({
   USER: "USER",
@@ -20,13 +24,14 @@ export const getUserRole = async ({
   if (!senderJid) return ROLES.USER;
 
   if (isOwner(senderJid)) return ROLES.OWNER;
-
   if (isBotAdmin(senderJid)) return ROLES.BOT_ADMIN;
 
   if (isGroup && groupMetadata) {
+    const senderNumber = senderJid.split("@")[0].split(":")[0];
+
     const participant = groupMetadata.participants?.find(p => {
-      const id = p.id || p.jid;
-      return id === senderJid;
+      const id = (p.id || p.jid || "").split("@")[0].split(":")[0];
+      return id === senderNumber;
     });
 
     if (
@@ -38,6 +43,13 @@ export const getUserRole = async ({
   }
 
   return ROLES.USER;
+};
+
+const levels = {
+  USER: 0,
+  GROUP_ADMIN: 1,
+  BOT_ADMIN: 2,
+  OWNER: 3
 };
 
 export const hasPermission = async ({
@@ -52,14 +64,23 @@ export const hasPermission = async ({
     groupMetadata
   });
 
-  const levels = {
-    USER: 0,
-    GROUP_ADMIN: 1,
-    BOT_ADMIN: 2,
-    OWNER: 3
-  };
+  return (levels[role] ?? 0) >=
+    (levels[requiredRole] ?? 0);
+};
 
-  return (levels[role] ?? 0) >= (levels[requiredRole] ?? 0);
+// commandHandler.js-এর প্রয়োজনীয় Export
+export const checkPermission = async (
+  senderJid,
+  requiredRole = "USER",
+  isGroup = false,
+  groupMetadata = null
+) => {
+  return hasPermission({
+    senderJid,
+    requiredRole,
+    isGroup,
+    groupMetadata
+  });
 };
 
 export const checkCommandPermission = async ({
@@ -68,14 +89,12 @@ export const checkCommandPermission = async ({
   isGroup = false,
   groupMetadata = null
 }) => {
-  const requiredRole = command?.config?.role || "USER";
-
-  return hasPermission({
+  return checkPermission(
     senderJid,
-    requiredRole,
+    command?.config?.role || "USER",
     isGroup,
     groupMetadata
-  });
+  );
 };
 
 export const getPermissionInfo = () => ({
